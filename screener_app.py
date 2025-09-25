@@ -1,363 +1,188 @@
-# screener_app.py
+# FnO Screener Dashboard: Current Price vs Max Pain (corrected)
+# Run with: streamlit run screener_app.py
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-from nsepython import *
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
-import time
+from nsepython import nse_optionchain_scrapper, fnolist
 
-st.set_page_config(page_title="F&O Max Pain Screener (nsepython + bhavcopy)", layout="wide")
+st.set_page_config(page_title="FnO Max Pain Screener (Fixed)", layout="wide")
+st.title("📊 FnO Screener: Current Price vs Max Pain — (corrected)")
 
-# -------------------------
-# Built-in fallback F&O list (used if API lookup fails)
-# Shortened here for readability; expand if you like.
-FNO_FALLBACK = [
-    "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS","SBIN","AXISBANK","KOTAKBANK","ITC","HINDUNILVR",
-    "HCLTECH","WIPRO","LT","BAJFINANCE","ADANIENT","ADANIPORTS","POWERGRID","ONGC","COALINDIA","BPCL",
-    "IOC","HDFCLIFE","ULTRACEMCO","MARUTI","M&M","TITAN","SUNPHARMA","CIPLA","NTPC","TATAMOTORS",
-    "TATASTEEL","HEROMOTOCO","JSWSTEEL","SBICARD","BAJAJFINSV","DIVISLAB","DRREDDY","GRASIM","EICHERMOT",
-    "HINDALCO","TECHM","TATAPOWER","TORNTPOWER","PIDILITIND","ONGC","BPCL","GODREJCP","ADANIENTERPRISES"
-]
-# You can replace/extend FNO_FALLBACK with the full list you use.
+# Sidebar: Filters
+min_dev = st.sidebar.slider(
+    "Show only stocks with deviation % greater than:", 
+    min_value=0.0, max_value=10.0, value=2.0, step=0.5
+)
 
-# -------------------------
-# Utility: Try multiple functions for FNO list (fnolist, nse_fno) with fallback
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_fno_list():
-    candidates = []
-    # try fnolist()
-    try:
-        fl = fnolist()
-        if fl:
-            # fnolist may return a list or dataframe depending on version; normalize
-            if isinstance(fl, (list, tuple)):
-                candidates = list(fl)
-            elif isinstance(fl, pd.DataFrame):
-                if "symbol" in fl.columns.str.lower():
-                    candidates = list(fl.iloc[:,0].astype(str).tolist())
-                else:
-                    candidates = list(fl.squeeze().astype(str).tolist())
-    except Exception:
-        pass
+search_symbol = st.sidebar.text_input("Search by stock symbol (e.g. INFY, RELIANCE):", "").upper()
+debug_single = st.sidebar.checkbox("Show debug (candidate payouts) for searched symbol", value=False)
 
-    # try nse_fno()
-    if not candidates:
-        try:
-            df = nse_fno()
-            if isinstance(df, pd.DataFrame) and "SYMBOL" in df.columns:
-                candidates = list(df["SYMBOL"].dropna().unique())
-        except Exception:
-            pass
-
-    # fallback to built-in list if still empty
-    if not candidates:
-        candidates = FNO_FALLBACK.copy()
-
-    # normalize (strings, uppercase)
-    candidates = [str(x).strip().upper() for x in candidates if str(x).strip()]
-    return sorted(list(dict.fromkeys(candidates)))  # unique preserve order
-
-# -------------------------
-# Bhavcopy (EOD) fetch
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_bhavcopy_for_range(days=90):
-    """
-    Build a combined bhavcopy-like dataframe for the last `days` trading days
-    using nsepython's bhavcopy_equities (which fetches a single day each call).
-    This function attempts to collect last `days` days but will skip days that fail.
-    Note: Bhavcopy is EOD — this may take time for many days. We limit attempts.
-    """
-    out = []
-    attempts = 0
-    day = datetime.today() - timedelta(days=1)
-    while len(out) < days and attempts < (days + 10):
-        try:
-            df = bhavcopy_equities(day)  # returns dataframe for that day
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                # Keep the symbol, CLOSE, TOTTRDQTY, TIMESTAMP (or create Date)
-                df2 = df[["SYMBOL","CLOSE","TOTTRDQTY"]].copy()
-                df2["DATE"] = day.strftime("%Y-%m-%d")
-                out.append(df2)
-        except Exception:
-            pass
-        attempts += 1
-        day = day - timedelta(days=1)
-
-    if not out:
-        return pd.DataFrame()   # failed to fetch any bhavcopy
-    combined = pd.concat(out, ignore_index=True)
-    # Ensure numeric columns
-    combined["CLOSE"] = pd.to_numeric(combined["CLOSE"], errors="coerce")
-    combined["TOTTRDQTY"] = pd.to_numeric(combined["TOTTRDQTY"], errors="coerce")
-    return combined
-
-# -------------------------
-# Option chain cache (per symbol)
-@st.cache_data(ttl=300, show_spinner=False)
+# Cache option chain fetch for short period to avoid re-fetching same symbol repeatedly
+@st.cache_data(ttl=60)  # cache for 60 seconds
 def fetch_option_chain(symbol):
-    """
-    Fetch option chain via nsepython. Returns dict or raises.
-    """
     return nse_optionchain_scrapper(symbol)
 
-def compute_max_pain_from_chain(chain):
+def calculate_max_pain_for_symbol(symbol):
     """
-    Given the option chain dict from nse_optionchain_scrapper,
-    compute true max pain (strike that minimizes total payout).
-    Returns (max_pain_strike (float/int), underlying_value (float)) or (None, None).
+    Returns dict with Symbol, LTP, Max Pain (strike), Diff% OR raises/returns None on error.
+    Uses the classical max-pain calculation (minimizes total payout to option buyers).
     """
     try:
-        rec = chain.get("records", {})
-        data = rec.get("data", []) or []
-        underlying = rec.get("underlyingValue", None)
-        if not data:
-            return None, underlying
+        option_chain = fetch_option_chain(symbol)
+        records = option_chain.get('records', {})
+        ltp = float(records.get('underlyingValue', 0.0))
 
-        expiry = rec.get("expiryDates", [None])[0]
-        ce_oi = {}
-        pe_oi = {}
-        strikes = set()
+        expiry_dates = records.get('expiryDates', [])
+        if not expiry_dates:
+            return None
+
+        expiry = expiry_dates[0]  # nearest by default
+
+        data = records.get('data', [])
+        # Build strike -> CE_OI and PE_OI (missing CE/PE treated as 0)
+        strikes = []
+        ce_oi_map = {}
+        pe_oi_map = {}
         for item in data:
-            if expiry and item.get("expiryDate") != expiry:
+            if item.get('expiryDate') != expiry:
                 continue
-            k = item.get("strikePrice")
+            k = item.get('strikePrice')
             if k is None:
                 continue
-            strikes.add(k)
+            strikes.append(k)
             ce = 0
             pe = 0
-            if item.get("CE"):
-                ce = int(item["CE"].get("openInterest") or 0)
-            if item.get("PE"):
-                pe = int(item["PE"].get("openInterest") or 0)
-            ce_oi[k] = ce_oi.get(k, 0) + ce
-            pe_oi[k] = pe_oi.get(k, 0) + pe
+            if item.get('CE'):
+                ce = int(item['CE'].get('openInterest') or 0)
+            if item.get('PE'):
+                pe = int(item['PE'].get('openInterest') or 0)
+            ce_oi_map[k] = ce_oi_map.get(k, 0) + ce
+            pe_oi_map[k] = pe_oi_map.get(k, 0) + pe
 
-        strikes = sorted(list(strikes))
+        strikes = sorted(set(strikes))
         if not strikes:
-            return None, underlying
+            return None
 
-        # For each candidate P compute total payout to option buyers
-        payout = {}
+        # For each candidate settlement price P (use the available strikes),
+        # compute total payout to option buyers:
+        # total(P) = sum_over_K [ CE_OI(K) * max(0, P - K) + PE_OI(K) * max(0, K - P) ]
+        total_payout_by_P = {}
         for P in strikes:
             total = 0
+            # simple loop (small number of strikes so this is fast)
             for K in strikes:
-                co = ce_oi.get(K, 0)
-                po = pe_oi.get(K, 0)
+                co = ce_oi_map.get(K, 0)
+                po = pe_oi_map.get(K, 0)
                 if P > K:
                     total += (P - K) * co
                 elif K > P:
                     total += (K - P) * po
-            payout[P] = total
+                # if P == K, contribution is 0 for that strike
+            total_payout_by_P[P] = total
 
-        # pick strike with minimum payout
-        max_pain_strike = min(payout, key=payout.get)
-        return float(max_pain_strike), underlying
-    except Exception:
-        return None, None
+        # Max pain = strike P with minimal total payout
+        max_pain_strike = min(total_payout_by_P, key=total_payout_by_P.get)
 
-# -------------------------
-# Historical series fetch (try stock_history)
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_history(symbol, days=90):
-    """
-    Try to grab historical OHLC (CLOSE & VOLUME) using nsepython.stock_history.
-    Returns pandas DataFrame with DATE index and CLOSE, TOTTRDQTY/VOLUME columns.
-    If fails, returns empty DataFrame.
-    """
-    try:
-        to_date = datetime.today()
-        from_date = to_date - timedelta(days=days*2)  # request more days to handle non-trading days
-        # nsepython.stock_history expects dd-mm-YYYY strings and symbol param
-        hist = stock_history(symbol=symbol, from_date=from_date.strftime("%d-%m-%Y"), to_date=to_date.strftime("%d-%m-%Y"))
-        if isinstance(hist, pd.DataFrame) and not hist.empty:
-            # normalize column names
-            cols = [c.upper() for c in hist.columns]
-            hist.columns = cols
-            # CLOSE might be 'CLOSE' or 'CLOSE' already; volume may be 'TOTTRDQTY' or 'VOLUME'
-            # Keep CLOSE and TOTTRDQTY if present
-            keep_cols = []
-            if "CLOSE" in hist.columns:
-                keep_cols.append("CLOSE")
-            elif "CLOSE_PRICE" in hist.columns:
-                hist["CLOSE"] = hist["CLOSE_PRICE"]
-                keep_cols.append("CLOSE")
-            if "TOTTRDQTY" in hist.columns:
-                keep_cols.append("TOTTRDQTY")
-            elif "VOLUME" in hist.columns:
-                hist["TOTTRDQTY"] = hist["VOLUME"]
-                keep_cols.append("TOTTRDQTY")
-            return hist.reset_index(drop=True)
-        else:
-            return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-# -------------------------
-# Analyze one symbol (robust)
-def analyze_one(symbol, bhav_combined):
-    """
-    Analyze a single symbol:
-    - compute CMP (from latest bhavcombined date if available; else from history)
-    - compute max pain from option chain
-    - compute EMA20/50 using history (if available)
-    - compute volume strength (today volume / avg vol)
-    - return dict or None
-    """
-    try:
-        sym = symbol.strip().upper()
-        # Try to get latest price and today's volume from the combined bhavcopy (which has many dates)
-        df_sym = bhav_combined[bhav_combined["SYMBOL"] == sym] if not bhav_combined.empty else pd.DataFrame()
-        cmp_price = None
-        today_vol = None
-        # If we have bhav combined, take last date for that symbol
-        if not df_sym.empty:
-            # sort by DATE
-            df_sym_sorted = df_sym.sort_values("DATE")
-            cmp_price = float(df_sym_sorted["CLOSE"].iloc[-1])
-            today_vol = float(df_sym_sorted["TOTTRDQTY"].iloc[-1])
-            # For series, take last 90 days of CLOSE & TOTTRDQTY
-            prices_series = df_sym_sorted["CLOSE"].astype(float).tail(90).reset_index(drop=True)
-            vol_series = df_sym_sorted["TOTTRDQTY"].astype(float).tail(90).reset_index(drop=True)
-        else:
-            prices_series = pd.Series(dtype=float)
-            vol_series = pd.Series(dtype=float)
-
-        # If bhav-based series is empty, try stock_history
-        if prices_series.empty or len(prices_series) < 10:
-            hist = fetch_history(sym, days=90)
-            if not hist.empty and "CLOSE" in hist.columns:
-                prices_series = hist["CLOSE"].astype(float).tail(90).reset_index(drop=True)
-                if "TOTTRDQTY" in hist.columns:
-                    vol_series = hist["TOTTRDQTY"].astype(float).tail(90).reset_index(drop=True)
-                # set cmp_price if missing
-                if cmp_price is None and not prices_series.empty:
-                    cmp_price = float(prices_series.iloc[-1])
-
-        # If still missing cmp_price, try nse_eq (live price)
-        if cmp_price is None:
-            try:
-                eq = nse_eq(sym)
-                cmp_price = float(eq.get("priceInfo", {}).get("lastPrice", np.nan))
-                today_vol = float(eq.get("preOpenMarket", {}).get("totalTradedVolume", np.nan) or np.nan)
-            except Exception:
-                pass
-
-        # compute EMAs (fallback: if not enough history, use cmp repeated to avoid crashes)
-        if prices_series.empty:
-            prices_series = pd.Series([cmp_price] * 50)
-        ema20 = float(prices_series.ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50 = float(prices_series.ewm(span=50, adjust=False).mean().iloc[-1])
-
-        # compute vol strength
-        vol_strength = 1.0
-        if not vol_series.empty and len(vol_series) >= 20:
-            avg_vol = vol_series.rolling(20).mean().iloc[-1]
-            today_v = vol_series.iloc[-1] if today_vol is None else today_vol
-            try:
-                vol_strength = float(today_v / avg_vol) if avg_vol > 0 else 1.0
-            except Exception:
-                vol_strength = 1.0
-        else:
-            vol_strength = 1.0
-
-        # Option chain & Max Pain
-        try:
-            chain = fetch_option_chain(sym)
-            max_pain, underlying = compute_max_pain_from_chain(chain)
-        except Exception:
-            max_pain, underlying = None, None
-
-        deviation = None
-        if max_pain and cmp_price and max_pain != 0:
-            deviation = ((cmp_price - max_pain) / max_pain) * 100
-
-        # Trend check: strictly price > ema20 > ema50 for Bullish, reverse for Bearish
-        trend = "Neutral"
-        try:
-            if (cmp_price is not None) and (cmp_price > ema20 > ema50):
-                trend = "Bullish"
-            elif (cmp_price is not None) and (cmp_price < ema20 < ema50):
-                trend = "Bearish"
-        except Exception:
-            trend = "Neutral"
+        diff_pct = ((ltp - max_pain_strike) / max_pain_strike) * 100 if max_pain_strike != 0 else 0.0
 
         return {
-            "Symbol": sym,
-            "CMP": round(float(cmp_price), 2) if cmp_price is not None and not math.isnan(cmp_price) else None,
-            "MaxPain": round(float(max_pain), 2) if max_pain else None,
-            "Deviation%": round(float(deviation), 2) if deviation is not None else None,
-            "EMA20": round(ema20, 2),
-            "EMA50": round(ema50, 2),
-            "VolumeStrength": round(vol_strength, 2),
-            "Trend": trend
+            "Symbol": symbol,
+            "LTP": round(ltp, 2),
+            "Max Pain": int(max_pain_strike),
+            "Diff %": round(diff_pct, 2),
+            "CandidatePayouts": total_payout_by_P  # for debug only
         }
 
-    except Exception:
-        return None
+    except Exception as e:
+        return {"Symbol": symbol, "Error": str(e)}
 
-# -------------------------
-# Top picks selector (robust fallback)
-def pick_top(df):
-    df_valid = df.dropna(subset=["CMP"]) if not df.empty else df
-    # prefer candidates with Deviation and VolumeStrength info
-    bullish_candidates = df_valid[df_valid["Deviation%"] > 0].copy()
-    bearish_candidates = df_valid[df_valid["Deviation%"] < 0].copy()
-
-    # primary sort: deviation desc + volume desc for bullish, deviation asc + volume desc for bearish
-    bull = bullish_candidates.sort_values(by=["Deviation%","VolumeStrength"], ascending=[False,False]).head(5)
-    bear = bearish_candidates.sort_values(by=["Deviation%","VolumeStrength"], ascending=[True,False]).head(5)
-
-    # fallback if empty: relax Trend/Volume constraints and pick by absolute deviation
-    if bull.empty:
-        fallback_b = df_valid[df_valid["Deviation%"].notnull()].sort_values(by="Deviation%", ascending=False).head(5)
-        bull = fallback_b
-    if bear.empty:
-        fallback_br = df_valid[df_valid["Deviation%"].notnull()].sort_values(by="Deviation%", ascending=True).head(5)
-        bear = fallback_br
-
-    # final fallback: if still empty, pick top by abs deviation
-    if bull.empty and not df_valid.empty:
-        bull = df_valid.assign(absdev=df_valid["Deviation%"].abs().fillna(0)).sort_values("absdev", ascending=False).head(5).drop(columns=["absdev"])
-    if bear.empty and not df_valid.empty:
-        bear = df_valid.assign(absdev=df_valid["Deviation%"].abs().fillna(0)).sort_values("absdev", ascending=False).head(5).drop(columns=["absdev"])
-
-    return bull.reset_index(drop=True), bear.reset_index(drop=True)
-
-# -------------------------
-# Streamlit UI & run
-st.title("📊 NSE F&O Max Pain Screener — nsepython + Bhavcopy (robust)")
-
-st.markdown("**How it works:** Loads F&O list (via nsepython), builds a bhavcopy series (EOD), fetches option chains, calculates Max Pain (correct payout method), computes EMA20/50 and volume strength, then shows full table + Top 5 bullish/bearish.")
-
-if st.button("Run full screener (may take 2-6 minutes on first run)"):
-    start = time.time()
-    st.info("Loading F&O list...")
-    fno_list = get_fno_list()
-    st.write(f"Found {len(fno_list)} F&O symbols (using API/fallback).")
-
-    st.info("Building bhavcopy series (EOD data). This may take up to a couple minutes for many days...")
-    bhav_combined = get_bhavcopy_for_range(days=90)
-    if bhav_combined.empty:
-        st.warning("Could not build bhavcopy history. The app will still try to fetch history per-symbol when possible.")
-
-    # parallel analyze (careful with workers to avoid throttling)
+# Run screener
+if st.button("Run Screener"):
+    fno_list = fnolist()
     results = []
-    max_workers = st.sidebar.slider("Parallel workers (lower if you see failures)", min_value=2, max_value=12, value=6, step=1)
-    progress = st.progress(0)
-    total = len(fno_list)
-    completed = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(analyze_one, sym, bhav_combined): sym for sym in fno_list}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                res = fut.result()
-                if res:
-                    results.append(res)
-            except Exception:
-                pass
-            completed += 1
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for idx, sym in enumerate(fno_list, start=1):
+        status_text.text(f"Processing {sym} ({idx}/{len(fno_list)})...")
+        res = calculate_max_pain_for_symbol(sym)
+        if res and res.get("Error") is None:
+            results.append({
+                "Symbol": res["Symbol"],
+                "LTP": res["LTP"],
+                "Max Pain": res["Max Pain"],
+                "Diff %": res["Diff %"],
+            })
+        else:
+            # skip errors but you can log them if needed
+            pass
+
+        progress_bar.progress(int(100 * idx / len(fno_list)))
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not results:
+        st.warning("No results — check that nsepython is working and FnO list is available.")
+    else:
+        df_results = pd.DataFrame(results)
+        # Apply deviation filter
+        df_filtered = df_results[df_results["Diff %"].abs() >= min_dev]
+
+        # Apply search filter if given
+        if search_symbol:
+            df_filtered = df_filtered[df_filtered["Symbol"].str.contains(search_symbol, case=False, na=False)]
+
+        # Sort by absolute deviation (largest first)
+        df_filtered = df_filtered.assign(absdev=df_filtered["Diff %"].abs())
+        df_sorted = df_filtered.sort_values("absdev", ascending=False).drop(columns=["absdev"])
+
+        st.subheader(f"Results (Deviation ≥ {min_dev}%)")
+        st.dataframe(df_sorted, use_container_width=True)
+
+        # Download button
+        csv = df_sorted.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Filtered CSV", data=csv, file_name="screener_results.csv", mime="text/csv")
+
+# --- Top 5 Bullish & Bearish Picks ---
+if not df_sorted.empty:
+    # Bullish = LTP > Max Pain, sorted by largest positive deviation
+    top5_bullish = (
+        df_sorted[df_sorted['Diff %'] > 0]
+        .sort_values("Diff %", ascending=False)
+        .head(5)
+    )
+
+    # Bearish = LTP < Max Pain, sorted by most negative deviation
+    top5_bearish = (
+        df_sorted[df_sorted['Diff %'] < 0]
+        .sort_values("Diff %")
+        .head(5)
+    )
+
+    if not top5_bullish.empty:
+        st.subheader("🚀 Top 5 Bullish (LTP > Max Pain)")
+        st.dataframe(top5_bullish, use_container_width=True)
+
+    if not top5_bearish.empty:
+        st.subheader("📉 Top 5 Bearish (LTP < Max Pain)")
+        st.dataframe(top5_bearish, use_container_width=True)
+
+        
+        # If user asked for debug and searched specific symbol, show candidate payouts
+        if debug_single and search_symbol:
+            # try fetch the single symbol to show candidate payouts
+            debug_sym = search_symbol
+            debug_res = calculate_max_pain_for_symbol(debug_sym)
+            if debug_res and "CandidatePayouts" in debug_res:
+                payouts = debug_res["CandidatePayouts"]
+                # show top 10 lowest payouts (likely near max pain)
+                df_dbg = pd.DataFrame(
+                    sorted(payouts.items(), key=lambda x: x[1])[:10],
+                    columns=["CandidateStrike", "TotalPayout"]
+                )
+                st.subheader(f"Debug: Candidate payouts for {debug_sym} (lowest first)")
+                st.dataframe(df_dbg)
+            else:
+                st.info("No debug data available for that symbol (maybe it's not FnO or fetch failed).")
