@@ -22,11 +22,13 @@ def fetch_emas(symbol):
     start = end - timedelta(days=90)
     try:
         df = get_history(symbol=symbol, start=start, end=end)
+        if df.empty:
+            return None, None
         df['20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['50EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
         latest = df.iloc[-1]
         return round(latest['20EMA'], 2), round(latest['50EMA'], 2)
-    except:
+    except Exception as e:
         return None, None
 
 def calculate_max_pain(symbol):
@@ -73,6 +75,7 @@ def calculate_max_pain(symbol):
 if st.button("Run Screener"):
     fno_list = fnolist()
     results = []
+    skipped = []
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -80,8 +83,13 @@ if st.button("Run Screener"):
     for idx, sym in enumerate(fno_list, start=1):
         status_text.text(f"Processing {sym} ({idx}/{len(fno_list)})...")
         res = calculate_max_pain(sym)
-        if res and res.get("Error") is None and res["20 EMA"] and res["50 EMA"]:
-            results.append(res)
+        if res and res.get("Error") is None:
+            if res["20 EMA"] and res["50 EMA"]:
+                results.append(res)
+            else:
+                skipped.append(sym)
+        else:
+            skipped.append(sym)
         progress_bar.progress(int(100 * idx / len(fno_list)))
 
     progress_bar.empty()
@@ -107,8 +115,15 @@ if st.button("Run Screener"):
         st.subheader("📉 Top 5 Bearish Stocks")
         st.dataframe(top_bearish)
 
+        st.subheader("📋 Full Screener Results")
+        st.dataframe(df)
+
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download Full Screener CSV", data=csv, file_name="fno_screener.csv", mime="text/csv")
+
+        if skipped:
+            st.info(f"Skipped {len(skipped)} symbols due to missing EMA or errors.")
+            st.write(skipped)
 
         if debug_single and search_symbol:
             debug_res = calculate_max_pain(search_symbol)
