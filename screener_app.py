@@ -42,8 +42,11 @@ def calculate_sma_rsi(df):
     return df
 
 def extract_underlying(fut_symbol):
-    """Extract underlying stock from F&O contract name"""
-    return re.match(r"[A-Z]+", fut_symbol).group(0)
+    """Extract underlying stock from F&O contract name (handles numbers too)"""
+    match = re.match(r"[A-Z0-9]+", fut_symbol)
+    if match:
+        return match.group(0)
+    return fut_symbol  # fallback
 
 def get_underlying_stocks():
     """Get unique underlying stock symbols for F&O"""
