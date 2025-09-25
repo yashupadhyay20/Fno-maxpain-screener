@@ -4,3 +4,4 @@ pandas
 yfinance
 numpy
 nsepy
+alpha_vantage
