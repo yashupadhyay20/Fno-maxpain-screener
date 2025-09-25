@@ -4,12 +4,13 @@ from nsepython import nse_optionchain_scrapper, fnolist
 from nsepy import get_history
 from datetime import date, timedelta
 
-st.set_page_config(page_title="FnO EMA & Max Pain Screener", layout="wide")
+st.set_page_config(page_title="FnO Screener: Price vs EMA vs Max Pain", layout="wide")
 st.title("📊 FnO Screener: Price vs EMA vs Max Pain")
 
 # Sidebar filters
 min_dev = st.sidebar.slider("Minimum deviation % from Max Pain:", 0.0, 10.0, 2.0, 0.5)
 search_symbol = st.sidebar.text_input("Search stock symbol:", "").upper()
+use_ema_filter = st.sidebar.checkbox("Filter only stocks with valid EMA data", value=False)
 debug_single = st.sidebar.checkbox("Show debug payouts", value=False)
 
 @st.cache_data(ttl=60)
@@ -28,7 +29,7 @@ def fetch_emas(symbol):
         df['50EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
         latest = df.iloc[-1]
         return round(latest['20EMA'], 2), round(latest['50EMA'], 2)
-    except Exception as e:
+    except:
         return None, None
 
 def calculate_max_pain(symbol):
@@ -84,10 +85,13 @@ if st.button("Run Screener"):
         status_text.text(f"Processing {sym} ({idx}/{len(fno_list)})...")
         res = calculate_max_pain(sym)
         if res and res.get("Error") is None:
-            if res["20 EMA"] and res["50 EMA"]:
-                results.append(res)
+            if use_ema_filter:
+                if res["20 EMA"] and res["50 EMA"]:
+                    results.append(res)
+                else:
+                    skipped.append(sym)
             else:
-                skipped.append(sym)
+                results.append(res)
         else:
             skipped.append(sym)
         progress_bar.progress(int(100 * idx / len(fno_list)))
@@ -99,6 +103,7 @@ if st.button("Run Screener"):
         st.warning("No valid results found.")
     else:
         df = pd.DataFrame(results)
+        df = df[df["Diff %"].notnull()]
         df = df[df["Diff %"].abs() >= min_dev]
         if search_symbol:
             df = df[df["Symbol"].str.contains(search_symbol, case=False)]
