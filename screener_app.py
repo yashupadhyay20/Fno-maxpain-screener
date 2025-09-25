@@ -145,6 +145,31 @@ if st.button("Run Screener"):
         csv = df_sorted.to_csv(index=False).encode('utf-8')
         st.download_button("Download Filtered CSV", data=csv, file_name="screener_results.csv", mime="text/csv")
 
+# --- Top 5 Bullish & Bearish Picks ---
+if not df_sorted.empty:
+    # Bullish = LTP > Max Pain, sorted by largest positive deviation
+    top5_bullish = (
+        df_sorted[df_sorted['Diff %'] > 0]
+        .sort_values("Diff %", ascending=False)
+        .head(5)
+    )
+
+    # Bearish = LTP < Max Pain, sorted by most negative deviation
+    top5_bearish = (
+        df_sorted[df_sorted['Diff %'] < 0]
+        .sort_values("Diff %")
+        .head(5)
+    )
+
+    if not top5_bullish.empty:
+        st.subheader("🚀 Top 5 Bullish (LTP > Max Pain)")
+        st.dataframe(top5_bullish, use_container_width=True)
+
+    if not top5_bearish.empty:
+        st.subheader("📉 Top 5 Bearish (LTP < Max Pain)")
+        st.dataframe(top5_bearish, use_container_width=True)
+
+        
         # If user asked for debug and searched specific symbol, show candidate payouts
         if debug_single and search_symbol:
             # try fetch the single symbol to show candidate payouts
