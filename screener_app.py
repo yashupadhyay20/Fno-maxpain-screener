@@ -1,11 +1,15 @@
 import streamlit as st
 import pandas as pd
+import time
+from alpha_vantage.techindicators import TechIndicators
 from nsepython import nse_optionchain_scrapper, fnolist
-from nsepy import get_history
-from datetime import date, timedelta
+from datetime import date
 
-st.set_page_config(page_title="FnO Screener: Price vs EMA vs Max Pain", layout="wide")
-st.title("📊 FnO Screener: Price vs EMA vs Max Pain")
+# Alpha Vantage setup
+ti = TechIndicators(key="ZTUYB9NTAZY2M9PC", output_format="pandas")
+
+st.set_page_config(page_title="FnO Screener: Alpha Vantage EMA + Max Pain", layout="wide")
+st.title("📊 FnO Screener: Price vs EMA vs Max Pain (Alpha Vantage)")
 
 # Sidebar filters
 min_dev = st.sidebar.slider("Minimum deviation % from Max Pain:", 0.0, 10.0, 2.0, 0.5)
@@ -17,19 +21,20 @@ debug_single = st.sidebar.checkbox("Show debug payouts", value=False)
 def fetch_option_chain(symbol):
     return nse_optionchain_scrapper(symbol)
 
-@st.cache_data(ttl=3600)
-def fetch_emas(symbol):
-    end = date.today()
-    start = end - timedelta(days=90)
+def fetch_alpha_emas(symbol):
     try:
-        df = get_history(symbol=symbol, start=start, end=end)
-        if df.empty:
-            return None, None
-        df['20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['50EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
-        latest = df.iloc[-1]
-        return round(latest['20EMA'], 2), round(latest['50EMA'], 2)
-    except:
+        av_symbol = f"{symbol}.NS"
+        ema20_df, _ = ti.get_ema(symbol=av_symbol, interval='daily', time_period=20, series_type='close')
+        time.sleep(12)  # Respect Alpha Vantage rate limits
+        ema50_df, _ = ti.get_ema(symbol=av_symbol, interval='daily', time_period=50, series_type='close')
+        time.sleep(12)
+
+        latest_ema20 = round(ema20_df.iloc[-1]['EMA'], 2)
+        latest_ema50 = round(ema50_df.iloc[-1]['EMA'], 2)
+
+        return latest_ema20, latest_ema50
+    except Exception as e:
+        print(f"Alpha Vantage error for {symbol}: {e}")
         return None, None
 
 def calculate_max_pain(symbol):
@@ -58,7 +63,7 @@ def calculate_max_pain(symbol):
 
         max_pain = min(payouts, key=payouts.get)
         diff_pct = ((ltp - max_pain) / max_pain) * 100 if max_pain else 0.0
-        ema20, ema50 = fetch_emas(symbol)
+        ema20, ema50 = fetch_alpha_emas(symbol)
 
         return {
             "Symbol": symbol,
@@ -104,14 +109,11 @@ if st.button("Run Screener"):
         if search_symbol:
             df = df[df["Symbol"].str.contains(search_symbol, case=False)]
 
-        # Convert EMA columns to numeric
         df["20 EMA"] = pd.to_numeric(df["20 EMA"], errors='coerce')
         df["50 EMA"] = pd.to_numeric(df["50 EMA"], errors='coerce')
 
-        # Filter rows with valid EMA data
-        df_valid = df.dropna(subset=["LTP", "20 EMA", "50 EMA"])
+        df_valid = df.dropna(subset=["LTP", "20 EMA", "50 EMA"]) if use_ema_filter else df.copy()
 
-        # Compute Bullish/Bearish flags
         df_valid["Bullish"] = (df_valid["LTP"] > df_valid["20 EMA"]) & (df_valid["20 EMA"] > df_valid["50 EMA"])
         df_valid["Bearish"] = (df_valid["LTP"] < df_valid["20 EMA"]) & (df_valid["20 EMA"] < df_valid["50 EMA"])
 
@@ -125,10 +127,10 @@ if st.button("Run Screener"):
         st.dataframe(top_bearish)
 
         st.subheader("📋 Full Screener Results")
-        st.dataframe(df)
+        st.dataframe(df_valid)
 
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Full Screener CSV", data=csv, file_name="fno_screener.csv", mime="text/csv")
+        csv = df_valid.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Screener CSV", data=csv, file_name="fno_screener.csv", mime="text/csv")
 
         if skipped:
             st.info(f"Skipped {len(skipped)} symbols due to missing EMA or errors.")
