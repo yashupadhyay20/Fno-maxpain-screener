@@ -1,145 +1,120 @@
+# app.py
 import streamlit as st
 import pandas as pd
-import time
-from alpha_vantage.techindicators import TechIndicators
-from nsepython import nse_optionchain_scrapper, fnolist
-from datetime import date
+from kiteconnect import KiteConnect
+import datetime
 
-# Alpha Vantage setup
-ti = TechIndicators(key="ZTUYB9NTAZY2M9PC", output_format="pandas")
+# -----------------------------------
+# CONFIG
+# -----------------------------------
+KITE_API_KEY = "j26mm94rwatmzarj"
+KITE_ACCESS_TOKEN = "jDEHV55RcYV4X1Za6UwP6aUJqz0tnxLB"
 
-st.set_page_config(page_title="FnO Screener: Alpha Vantage EMA + Max Pain", layout="wide")
-st.title("📊 FnO Screener: Price vs EMA vs Max Pain (Alpha Vantage)")
+kite = KiteConnect(api_key=KITE_API_KEY)
+kite.set_access_token(KITE_ACCESS_TOKEN)
 
-# Sidebar filters
-min_dev = st.sidebar.slider("Minimum deviation % from Max Pain:", 0.0, 10.0, 2.0, 0.5)
-search_symbol = st.sidebar.text_input("Search stock symbol:", "").upper()
-use_ema_filter = st.sidebar.checkbox("Filter only stocks with valid EMA data", value=False)
-debug_single = st.sidebar.checkbox("Show debug payouts", value=False)
+st.set_page_config(page_title="F&O Screener with OI", layout="wide")
+st.title("📈 F&O Screener with Open Interest & Option Chain Analysis")
 
-@st.cache_data(ttl=60)
-def fetch_option_chain(symbol):
-    return nse_optionchain_scrapper(symbol)
+st.sidebar.header("Filter Options")
+lookback = st.sidebar.slider("Lookback (days for SMA/RSI)", 10, 90, 30)
+show_rsi = st.sidebar.checkbox("Filter RSI < 30 / > 70")
 
-def fetch_alpha_emas(symbol):
+# -----------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_sma_rsi(df):
+    df["SMA20"] = df["close"].rolling(20).mean()
+    df["SMA50"] = df["close"].rolling(50).mean()
+    df["RSI"] = compute_rsi(df["close"], 14)
+    return df
+
+def get_fno_stocks():
+    """Fetch all F&O stocks from NFO segment"""
+    instruments = kite.instruments("NFO")
+    fo_stocks = sorted(set([i["tradingsymbol"].split()[0] for i in instruments if i["segment"] == "NFO-FUT"]))
+    return fo_stocks
+
+def get_option_chain(stock_symbol):
+    """Fetch option chain for a stock and compute PCR"""
     try:
-        av_symbol = f"{symbol}.NS"
-        ema20_df, _ = ti.get_ema(symbol=av_symbol, interval='daily', time_period=20, series_type='close')
-        time.sleep(12)  # Respect Alpha Vantage rate limits
-        ema50_df, _ = ti.get_ema(symbol=av_symbol, interval='daily', time_period=50, series_type='close')
-        time.sleep(12)
-
-        latest_ema20 = round(ema20_df.iloc[-1]['EMA'], 2)
-        latest_ema50 = round(ema50_df.iloc[-1]['EMA'], 2)
-
-        return latest_ema20, latest_ema50
+        option_data = kite.ltp(["NFO:" + stock_symbol + "-CE", "NFO:" + stock_symbol + "-PE"])
+        ce_oi = option_data.get(f"NFO:{stock_symbol}-CE", {}).get("oi", 0)
+        pe_oi = option_data.get(f"NFO:{stock_symbol}-PE", {}).get("oi", 0)
+        pcr = pe_oi / ce_oi if ce_oi != 0 else 0
+        return ce_oi, pe_oi, pcr
     except Exception as e:
-        print(f"Alpha Vantage error for {symbol}: {e}")
-        return None, None
+        return 0, 0, 0
 
-def calculate_max_pain(symbol):
+# -----------------------------------
+# F&O Stocks Selection
+# -----------------------------------
+fo_stocks = get_fno_stocks()
+selected_stocks = st.multiselect("Select F&O Stocks", fo_stocks, default=fo_stocks[:5])
+
+# -----------------------------------
+# Fetch Market Data & Option Chain
+# -----------------------------------
+results = []
+
+for stock in selected_stocks:
     try:
-        chain = fetch_option_chain(symbol)
-        records = chain.get('records', {})
-        ltp = float(records.get('underlyingValue', 0.0))
-        expiry = records.get('expiryDates', [])[0]
-        data = records.get('data', [])
-        ce_oi, pe_oi, strikes = {}, {}, []
+        # Get historical OHLC (past 90 days)
+        historical = kite.historical_data(instrument_token=kite.ltp("NSE:" + stock)["NSE:" + stock]["instrument_token"],
+                                          from_date=datetime.date.today()-datetime.timedelta(days=lookback*2),
+                                          to_date=datetime.date.today(),
+                                          interval="day")
+        if not historical:
+            continue
 
-        for item in data:
-            if item.get('expiryDate') != expiry: continue
-            k = item.get('strikePrice')
-            if k is None: continue
-            strikes.append(k)
-            ce = int(item.get('CE', {}).get('openInterest', 0))
-            pe = int(item.get('PE', {}).get('openInterest', 0))
-            ce_oi[k] = ce_oi.get(k, 0) + ce
-            pe_oi[k] = pe_oi.get(k, 0) + pe
+        df = pd.DataFrame(historical)
+        df.rename(columns={"close": "close", "volume": "volume"}, inplace=True)
+        df = calculate_sma_rsi(df)
 
-        payouts = {}
-        for P in sorted(set(strikes)):
-            total = sum((P - K) * ce_oi.get(K, 0) if P > K else (K - P) * pe_oi.get(K, 0) for K in strikes)
-            payouts[P] = total
+        last = df.iloc[-1]
 
-        max_pain = min(payouts, key=payouts.get)
-        diff_pct = ((ltp - max_pain) / max_pain) * 100 if max_pain else 0.0
-        ema20, ema50 = fetch_alpha_emas(symbol)
+        # Option Chain OI
+        ce_oi, pe_oi, pcr = get_option_chain(stock)
 
-        return {
-            "Symbol": symbol,
-            "LTP": round(ltp, 2),
-            "Max Pain": int(max_pain),
-            "Diff %": round(diff_pct, 2),
-            "20 EMA": ema20,
-            "50 EMA": ema50,
-            "CandidatePayouts": payouts
-        }
+        results.append({
+            "Stock": stock,
+            "Close": last["close"],
+            "SMA20": last["SMA20"],
+            "SMA50": last["SMA50"],
+            "RSI": last["RSI"],
+            "CE_OI": ce_oi,
+            "PE_OI": pe_oi,
+            "PCR": pcr
+        })
+
     except Exception as e:
-        return {"Symbol": symbol, "Error": str(e)}
+        st.warning(f"Data fetch failed for {stock}: {e}")
 
-# Run Screener
-if st.button("Run Screener"):
-    fno_list = fnolist()
-    results = []
-    skipped = []
+# -----------------------------------
+# Display Screener
+# -----------------------------------
+if results:
+    df_result = pd.DataFrame(results)
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    if show_rsi:
+        df_result = df_result[(df_result["RSI"] < 30) | (df_result["RSI"] > 70)]
 
-    for idx, sym in enumerate(fno_list, start=1):
-        status_text.text(f"Processing {sym} ({idx}/{len(fno_list)})...")
-        res = calculate_max_pain(sym)
-        if res and res.get("Error") is None:
-            results.append(res)
-            if not res["20 EMA"] or not res["50 EMA"]:
-                skipped.append(sym)
-        else:
-            skipped.append(sym)
-        progress_bar.progress(int(100 * idx / len(fno_list)))
+    st.subheader("📊 Screener Results")
+    st.dataframe(df_result, use_container_width=True)
 
-    progress_bar.empty()
-    status_text.empty()
+    st.subheader("⚡ Trade Signals based on SMA + OI")
+    bullish = df_result[(df_result["SMA20"] > df_result["SMA50"]) & (df_result["PCR"] < 1)]
+    bearish = df_result[(df_result["SMA20"] < df_result["SMA50"]) & (df_result["PCR"] > 1)]
 
-    if not results:
-        st.warning("No valid results found.")
-    else:
-        df = pd.DataFrame(results)
-        df = df[df["Diff %"].notnull()]
-        df = df[df["Diff %"].abs() >= min_dev]
-        if search_symbol:
-            df = df[df["Symbol"].str.contains(search_symbol, case=False)]
+    st.write("**Bullish Candidates (Golden Cross + PCR < 1):**")
+    st.table(bullish[["Stock", "Close", "RSI", "CE_OI", "PE_OI", "PCR"]])
 
-        df["20 EMA"] = pd.to_numeric(df["20 EMA"], errors='coerce')
-        df["50 EMA"] = pd.to_numeric(df["50 EMA"], errors='coerce')
-
-        df_valid = df.dropna(subset=["LTP", "20 EMA", "50 EMA"]) if use_ema_filter else df.copy()
-
-        df_valid["Bullish"] = (df_valid["LTP"] > df_valid["20 EMA"]) & (df_valid["20 EMA"] > df_valid["50 EMA"])
-        df_valid["Bearish"] = (df_valid["LTP"] < df_valid["20 EMA"]) & (df_valid["20 EMA"] < df_valid["50 EMA"])
-
-        top_bullish = df_valid[df_valid["Bullish"]].sort_values("Diff %", ascending=False).head(5)
-        top_bearish = df_valid[df_valid["Bearish"]].sort_values("Diff %").head(5)
-
-        st.subheader("📈 Top 5 Bullish Stocks")
-        st.dataframe(top_bullish)
-
-        st.subheader("📉 Top 5 Bearish Stocks")
-        st.dataframe(top_bearish)
-
-        st.subheader("📋 Full Screener Results")
-        st.dataframe(df_valid)
-
-        csv = df_valid.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Screener CSV", data=csv, file_name="fno_screener.csv", mime="text/csv")
-
-        if skipped:
-            st.info(f"Skipped {len(skipped)} symbols due to missing EMA or errors.")
-            st.write(skipped)
-
-        if debug_single and search_symbol:
-            debug_res = calculate_max_pain(search_symbol)
-            if debug_res and "CandidatePayouts" in debug_res:
-                df_dbg = pd.DataFrame(sorted(debug_res["CandidatePayouts"].items(), key=lambda x: x[1])[:10],
-                                      columns=["Strike", "Total Payout"])
-                st.subheader(f"Debug Payouts for {search_symbol}")
-                st.dataframe(df_dbg)
+    st.write("**Bearish Candidates (Death Cross + PCR > 1):**")
+    st.table(bearish[["Stock", "Close", "RSI", "CE_OI", "PE_OI", "PCR"]])
