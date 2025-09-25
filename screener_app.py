@@ -85,13 +85,9 @@ if st.button("Run Screener"):
         status_text.text(f"Processing {sym} ({idx}/{len(fno_list)})...")
         res = calculate_max_pain(sym)
         if res and res.get("Error") is None:
-            if use_ema_filter:
-                if res["20 EMA"] and res["50 EMA"]:
-                    results.append(res)
-                else:
-                    skipped.append(sym)
-            else:
-                results.append(res)
+            results.append(res)
+            if not res["20 EMA"] or not res["50 EMA"]:
+                skipped.append(sym)
         else:
             skipped.append(sym)
         progress_bar.progress(int(100 * idx / len(fno_list)))
@@ -108,11 +104,19 @@ if st.button("Run Screener"):
         if search_symbol:
             df = df[df["Symbol"].str.contains(search_symbol, case=False)]
 
-        df["Bullish"] = (df["LTP"] > df["20 EMA"]) & (df["20 EMA"] > df["50 EMA"])
-        df["Bearish"] = (df["LTP"] < df["20 EMA"]) & (df["20 EMA"] < df["50 EMA"])
+        # Convert EMA columns to numeric
+        df["20 EMA"] = pd.to_numeric(df["20 EMA"], errors='coerce')
+        df["50 EMA"] = pd.to_numeric(df["50 EMA"], errors='coerce')
 
-        top_bullish = df[df["Bullish"]].sort_values("Diff %", ascending=False).head(5)
-        top_bearish = df[df["Bearish"]].sort_values("Diff %").head(5)
+        # Filter rows with valid EMA data
+        df_valid = df.dropna(subset=["LTP", "20 EMA", "50 EMA"])
+
+        # Compute Bullish/Bearish flags
+        df_valid["Bullish"] = (df_valid["LTP"] > df_valid["20 EMA"]) & (df_valid["20 EMA"] > df_valid["50 EMA"])
+        df_valid["Bearish"] = (df_valid["LTP"] < df_valid["20 EMA"]) & (df_valid["20 EMA"] < df_valid["50 EMA"])
+
+        top_bullish = df_valid[df_valid["Bullish"]].sort_values("Diff %", ascending=False).head(5)
+        top_bearish = df_valid[df_valid["Bearish"]].sort_values("Diff %").head(5)
 
         st.subheader("📈 Top 5 Bullish Stocks")
         st.dataframe(top_bullish)
