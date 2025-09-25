@@ -1,7 +1,7 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 # ---------- Utility Functions ----------
 def get_max_pain(ticker):
@@ -17,15 +17,14 @@ def get_max_pain(ticker):
         puts = chain.puts[['strike', 'openInterest']].rename(columns={'openInterest': 'putOI'})
         df = pd.merge(calls, puts, on="strike", how="outer").fillna(0)
 
-        # Calculate total pain for each strike
+        # total pain
         df['callPain'] = (df['callOI'] * abs(df['strike'] - df['strike'].mean()))
         df['putPain'] = (df['putOI'] * abs(df['strike'] - df['strike'].mean()))
         df['totalPain'] = df['callPain'] + df['putPain']
 
         max_pain_strike = df.loc[df['totalPain'].idxmin(), 'strike']
         return max_pain_strike, expiry
-    except Exception as e:
-        print(f"Error fetching option chain for {ticker}: {e}")
+    except Exception:
         return None, None
 
 
@@ -33,7 +32,7 @@ def get_stock_data(ticker):
     stock = yf.Ticker(ticker)
     hist = stock.history(period="3mo")
     if hist.empty:
-        return None, None, None
+        return None, None, None, None
 
     close = hist['Close']
     volume = hist['Volume']
@@ -61,7 +60,6 @@ def analyze_stocks(tickers):
 
         deviation_pct = ((price - max_pain) / max_pain) * 100
 
-        # Trend check
         trend = "Bullish" if price > ema20 > ema50 else "Bearish" if price < ema20 < ema50 else "Neutral"
 
         results.append({
@@ -88,21 +86,27 @@ def pick_top_stocks(df):
     return top_bullish, top_bearish
 
 
-# ---------- Main Run ----------
-if __name__ == "__main__":
-    tickers = ["PNBHOUSING.NS", "RELIANCE.NS", "HDFCBANK.NS", "TCS.NS", "INFY.NS", "SBIN.NS"]
+# ---------- Streamlit App ----------
+st.title("📊 Max Pain Screener with Bullish/Bearish Picks")
 
-    df = analyze_stocks(tickers)
+tickers_input = st.text_area("Enter stock tickers (comma-separated, NSE tickers end with .NS):",
+                             "PNBHOUSING.NS, RELIANCE.NS, HDFCBANK.NS, TCS.NS, INFY.NS, SBIN.NS")
+tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
+
+if st.button("Run Screener"):
+    with st.spinner("Fetching data..."):
+        df = analyze_stocks(tickers)
+
     if not df.empty:
+        st.subheader("📋 Full Screener Output")
+        st.dataframe(df)
+
         top_bullish, top_bearish = pick_top_stocks(df)
 
-        print("\n=== Full Screener Output ===")
-        print(df)
+        st.subheader("🚀 Top 5 Bullish Picks")
+        st.dataframe(top_bullish[['Ticker', 'Price', 'MaxPain', 'Deviation%', 'Trend', 'VolumeStrength']])
 
-        print("\n=== Top 5 Bullish ===")
-        print(top_bullish[['Ticker', 'Price', 'MaxPain', 'Deviation%', 'Trend', 'VolumeStrength']])
-
-        print("\n=== Top 5 Bearish ===")
-        print(top_bearish[['Ticker', 'Price', 'MaxPain', 'Deviation%', 'Trend', 'VolumeStrength']])
+        st.subheader("🔻 Top 5 Bearish Picks")
+        st.dataframe(top_bearish[['Ticker', 'Price', 'MaxPain', 'Deviation%', 'Trend', 'VolumeStrength']])
     else:
-        print("No valid data fetched.")
+        st.warning("No valid data fetched. Try different tickers.")
