@@ -5,3 +5,4 @@ yfinance
 numpy
 nsepy
 alpha_vantage
+KiteConnect
