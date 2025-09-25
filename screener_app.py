@@ -1,9 +1,8 @@
-# app.py
+# fno_screener.py
 import streamlit as st
 import pandas as pd
 from kiteconnect import KiteConnect
 from alpha_vantage.timeseries import TimeSeries
-import datetime
 import re
 
 # -----------------------------
@@ -19,11 +18,10 @@ kite.set_access_token(KITE_ACCESS_TOKEN)
 ts = TimeSeries(key=ALPHA_VANTAGE_KEY, output_format="pandas")
 
 st.set_page_config(page_title="F&O Screener", layout="wide")
-st.title("📈 F&O Screener - Underlying Stocks Only")
+st.title("📈 F&O Screener - All Underlying Stocks")
 
-st.sidebar.header("Filter Options")
-lookback = st.sidebar.slider("Lookback (days for SMA/RSI)", 20, 90, 30)
-show_rsi = st.sidebar.checkbox("Filter RSI < 30 / > 70")
+LOOKBACK = 30  # days for SMA/RSI
+RSI_FILTER = True  # Filter RSI <30 or >70
 
 # -----------------------------
 # HELPER FUNCTIONS
@@ -42,16 +40,16 @@ def calculate_sma_rsi(df):
     return df
 
 def extract_underlying(fut_symbol):
-    """Extract underlying stock from F&O contract name (handles numbers too)"""
+    """Extract underlying stock from F&O contract name"""
     match = re.match(r"[A-Z0-9]+", fut_symbol)
     if match:
         return match.group(0)
-    return fut_symbol  # fallback
+    return fut_symbol
 
 def get_underlying_stocks():
     """Get unique underlying stock symbols for F&O"""
     instruments = kite.instruments("NFO")
-    underlyings = sorted(set([extract_underlying(inst["tradingsymbol"]) 
+    underlyings = sorted(set([extract_underlying(inst["tradingsymbol"])
                               for inst in instruments if inst["segment"]=="NFO-FUT"]))
     return underlyings
 
@@ -62,11 +60,10 @@ def get_fut_oi(stock):
         if inst["segment"]=="NFO-FUT" and inst["tradingsymbol"].startswith(stock):
             try:
                 ltp_data = kite.ltp(f"NFO:{inst['tradingsymbol']}")
-                oi = ltp_data[f"NFO:{inst['tradingsymbol']}"]["oi"]
-                return oi
+                return ltp_data[f"NFO:{inst['tradingsymbol']}"].get("oi", 0)
             except:
-                return None
-    return None
+                return 0
+    return 0
 
 def get_option_pcr(stock):
     """Fetch CE/PE OI for PCR calculation"""
@@ -85,7 +82,7 @@ def get_alpha_data(stock):
     """Fetch OHLC from Alpha Vantage for underlying stock"""
     try:
         data, _ = ts.get_daily(symbol=f"{stock}.BSE", outputsize="compact")
-        df = data.tail(lookback).copy()
+        df = data.tail(LOOKBACK).copy()
         df = calculate_sma_rsi(df)
         last = df.iloc[-1]
         return last["4. close"], last["SMA20"], last["SMA50"], last["RSI"]
@@ -93,18 +90,18 @@ def get_alpha_data(stock):
         return None, None, None, None
 
 # -----------------------------
-# MAIN
+# FETCH DATA FOR ALL F&O STOCKS
 # -----------------------------
+st.info("Fetching data for all F&O underlying stocks... This may take a few minutes.")
 underlying_stocks = get_underlying_stocks()
-selected_stocks = st.multiselect("Select Underlying Stocks", underlying_stocks, default=underlying_stocks[:5])
-
 results = []
-for stock in selected_stocks:
+
+for stock in underlying_stocks:
     close, sma20, sma50, rsi = get_alpha_data(stock)
     fut_oi = get_fut_oi(stock)
     ce_oi, pe_oi, pcr = get_option_pcr(stock)
 
-    if None in [close, sma20, sma50, rsi, fut_oi]:
+    if None in [close, sma20, sma50, rsi]:
         continue
 
     results.append({
@@ -119,22 +116,23 @@ for stock in selected_stocks:
         "PCR": pcr
     })
 
+df = pd.DataFrame(results)
+
+if RSI_FILTER:
+    df = df[(df["RSI"] < 30) | (df["RSI"] > 70)]
+
 # -----------------------------
-# DISPLAY
+# DISPLAY TABLES
 # -----------------------------
-if results:
-    df = pd.DataFrame(results)
+st.subheader("📊 All F&O Underlying Stocks Data")
+st.dataframe(df, use_container_width=True)
 
-    if show_rsi:
-        df = df[(df["RSI"] < 30) | (df["RSI"] > 70)]
+# Top 5 Bullish: SMA20>SMA50 & PCR<1
+bullish = df[(df["SMA20"] > df["SMA50"]) & (df["PCR"] < 1)].sort_values(by="Fut_OI", ascending=False).head(5)
+st.subheader("⚡ Top 5 Bullish Stocks")
+st.table(bullish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
 
-    st.subheader("📊 Screener Results")
-    st.dataframe(df, use_container_width=True)
-
-    st.subheader("⚡ Most Bullish Stocks")
-    bullish = df[(df["SMA20"] > df["SMA50"]) & (df["PCR"] < 1)].sort_values(by="Fut_OI", ascending=False)
-    st.table(bullish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
-
-    st.subheader("⚡ Most Bearish Stocks")
-    bearish = df[(df["SMA20"] < df["SMA50"]) & (df["PCR"] > 1)].sort_values(by="Fut_OI", ascending=False)
-    st.table(bearish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
+# Top 5 Bearish: SMA20<SMA50 & PCR>1
+bearish = df[(df["SMA20"] < df["SMA50"]) & (df["PCR"] > 1)].sort_values(by="Fut_OI", ascending=False).head(5)
+st.subheader("⚡ Top 5 Bearish Stocks")
+st.table(bearish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
