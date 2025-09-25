@@ -2,31 +2,43 @@
 import streamlit as st
 import pandas as pd
 from kiteconnect import KiteConnect
+from alpha_vantage.timeseries import TimeSeries
+import datetime
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 KITE_API_KEY = "j26mm94rwatmzarj"
 KITE_ACCESS_TOKEN = "jDEHV55RcYV4X1Za6UwP6aUJqz0tnxLB"
+ALPHA_VANTAGE_KEY = "ZTUYB9NTAZY2M9PC"
 
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
 
-st.set_page_config(page_title="F&O Screener Simplified", layout="wide")
-st.title("📈 F&O Screener - Bullish/Bearish Stocks")
+ts = TimeSeries(key=ALPHA_VANTAGE_KEY, output_format="pandas")
+
+st.set_page_config(page_title="F&O Screener", layout="wide")
+st.title("📈 F&O Screener - Real SMA/RSI + OI/PCR")
 
 st.sidebar.header("Filter Options")
+lookback = st.sidebar.slider("Lookback (days for SMA/RSI)", 20, 90, 30)
 show_rsi = st.sidebar.checkbox("Filter RSI < 30 / > 70")
 
 # -----------------------------
 # HELPER FUNCTIONS
 # -----------------------------
-def compute_rsi(prices, period=14):
-    delta = prices.diff()
+def compute_rsi(series, period=14):
+    delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = -delta.clip(upper=0).rolling(period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
+
+def calculate_sma_rsi(df):
+    df["SMA20"] = df["4. close"].rolling(20).mean()
+    df["SMA50"] = df["4. close"].rolling(50).mean()
+    df["RSI"] = compute_rsi(df["4. close"], 14)
+    return df
 
 def get_fno_stocks():
     instruments = kite.instruments("NFO")
@@ -55,31 +67,40 @@ def get_option_pcr(stock):
     except:
         return 0, 0, 0
 
+def get_alpha_data(stock):
+    """Fetch historical OHLC from Alpha Vantage"""
+    try:
+        data, _ = ts.get_daily(symbol=f"{stock}.BSE", outputsize="compact")
+        df = data.tail(lookback).copy()
+        df = calculate_sma_rsi(df)
+        last = df.iloc[-1]
+        return last["4. close"], last["SMA20"], last["SMA50"], last["RSI"]
+    except:
+        # fallback if BSE symbol not found
+        return None, None, None, None
+
 # -----------------------------
-# Fetch F&O Data
+# F&O Stocks Selection
 # -----------------------------
 fo_stocks = get_fno_stocks()
 selected_stocks = st.multiselect("Select F&O Stocks", fo_stocks, default=fo_stocks[:5])
 
+# -----------------------------
+# Fetch Data
+# -----------------------------
 results = []
+
 for stock in selected_stocks:
     price, fut_oi = get_fut_data(stock)
     ce_oi, pe_oi, pcr = get_option_pcr(stock)
+    close, sma20, sma50, rsi = get_alpha_data(stock)
 
-    if price is None:
+    if None in [price, close, sma20, sma50, rsi]:
         continue
-
-    # simple SMA/RSI mock using last price (you can replace with proper historical later)
-    import pandas as pd
-    import numpy as np
-    prices = pd.Series(np.random.normal(price, 2, 30))  # placeholder series
-    sma20 = prices.rolling(20).mean().iloc[-1]
-    sma50 = prices.rolling(50).mean().iloc[-1]
-    rsi = compute_rsi(prices).iloc[-1]
 
     results.append({
         "Stock": stock,
-        "Price": price,
+        "Price": close,
         "SMA20": sma20,
         "SMA50": sma50,
         "RSI": rsi,
@@ -90,7 +111,7 @@ for stock in selected_stocks:
     })
 
 # -----------------------------
-# Display Screener
+# Display Results
 # -----------------------------
 if results:
     df = pd.DataFrame(results)
@@ -103,4 +124,8 @@ if results:
 
     st.subheader("⚡ Most Bullish Stocks")
     bullish = df[(df["SMA20"] > df["SMA50"]) & (df["PCR"] < 1)].sort_values(by="Fut_OI", ascending=False)
-    st.table(bullish[["Stoc]()]()
+    st.table(bullish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
+
+    st.subheader("⚡ Most Bearish Stocks")
+    bearish = df[(df["SMA20"] < df["SMA50"]) & (df["PCR"] > 1)].sort_values(by="Fut_OI", ascending=False)
+    st.table(bearish[["Stock", "Price", "RSI", "Fut_OI", "PCR"]])
