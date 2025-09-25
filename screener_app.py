@@ -2,18 +2,36 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from nsepython import nse_optionchain_scrapper, nse_eq
+import requests
+import io
 import datetime
 
-# -------- Full NSE F&O Stock List --------
-FNO_TICKERS = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "SBIN", "AXISBANK", "KOTAKBANK",
-    "ITC", "HINDUNILVR", "HCLTECH", "WIPRO", "LT", "BAJFINANCE", "ADANIENT", "ADANIPORTS",
-    "POWERGRID", "ONGC", "COALINDIA", "BPCL", "IOC", "HDFCLIFE", "ULTRACEMCO", "MARUTI",
-    "M&M", "TITAN", "SUNPHARMA", "CIPLA", "NTPC", "TATAMOTORS", "TATASTEEL", "HEROMOTOCO"
-]
-
-# ---------- Utility Functions ----------
+# -------- Fetch Latest F&O Stock List --------
 @st.cache_data(show_spinner=False)
+def get_fno_list():
+    url = "https://www1.nseindia.com/content/fo/fo_underlyinglist.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return []
+    df = pd.read_csv(io.StringIO(r.text))
+    return df["SYMBOL"].dropna().unique().tolist()
+
+# -------- Download Bhavcopy --------
+@st.cache_data(show_spinner=False)
+def get_bhavcopy(date=None):
+    if date is None:
+        date = datetime.date.today() - datetime.timedelta(days=1)
+    date_str = date.strftime("%d%m%Y")
+    url = f"https://www1.nseindia.com/content/historical/EQUITIES/{date.year}/{date.strftime('%b').upper()}/cm{date_str}bhav.csv.zip"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return None
+    df = pd.read_csv(io.BytesIO(r.content), compression="zip")
+    return df
+
+# -------- Max Pain Calculation from Option Chain --------
 def get_max_pain(symbol):
     try:
         oc = nse_optionchain_scrapper(symbol)
@@ -59,47 +77,41 @@ def get_max_pain(symbol):
     except Exception:
         return None, None
 
-@st.cache_data(show_spinner=False)
-def get_stock_data(symbol):
-    try:
-        eq = nse_eq(symbol)
-        if not eq:
-            return None, None, None, None
-        price = eq.get("priceInfo", {}).get("lastPrice", None)
-        day_volume = eq.get("preOpenMarket", {}).get("totalTradedVolume", None)
-        if not price or not day_volume:
-            return None, None, None, None
-
-        # Fake historical data (since nsepython doesn’t give it directly)
-        # For EMA, we’ll simulate with lastPrice repeated
-        hist = [price] * 60
-        ema20 = pd.Series(hist).ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = pd.Series(hist).ewm(span=50, adjust=False).mean().iloc[-1]
-
-        vol_strength = 1.0  # since we don’t have historical avg vol yet
-        return price, ema20, ema50, vol_strength
-    except Exception:
-        return None, None, None, None
-
-def analyze_stocks(tickers):
+# -------- Stock Analysis Combining Bhavcopy + Option Chain --------
+def analyze_stocks(fno_list, bhav_df):
     results = []
-    for t in tickers:
-        price, ema20, ema50, vol_strength = get_stock_data(t)
-        if price is None:
+    for symbol in fno_list:
+        try:
+            stock_data = bhav_df[bhav_df["SYMBOL"] == symbol]
+            if stock_data.empty:
+                continue
+
+            price = stock_data["CLOSE"].iloc[-1]
+            volumes = stock_data["TOTTRDQTY"].tail(50)  # last 50 days
+            prices = stock_data["CLOSE"].tail(50)
+
+            ema20 = prices.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema50 = prices.ewm(span=50, adjust=False).mean().iloc[-1]
+            avg_volume = volumes.rolling(20).mean().iloc[-1]
+            vol_strength = (volumes.iloc[-1] / avg_volume) if avg_volume > 0 else 0
+
+            max_pain, underlying_value = get_max_pain(symbol)
+            deviation_pct = ((price - max_pain) / max_pain) * 100 if max_pain else None
+
+            trend = "Bullish" if price > ema20 > ema50 else "Bearish" if price < ema20 < ema50 else "Neutral"
+
+            results.append({
+                "Ticker": symbol,
+                "Price": round(price, 2),
+                "MaxPain": round(max_pain, 2) if max_pain else None,
+                "Deviation%": round(deviation_pct, 2) if deviation_pct else None,
+                "EMA20": round(ema20, 2),
+                "EMA50": round(ema50, 2),
+                "VolumeStrength": round(vol_strength, 2),
+                "Trend": trend
+            })
+        except Exception:
             continue
-        max_pain, underlying_value = get_max_pain(t)
-        deviation_pct = ((price - max_pain) / max_pain) * 100 if max_pain else None
-        trend = "Bullish" if price > ema20 > ema50 else "Bearish" if price < ema20 < ema50 else "Neutral"
-        results.append({
-            "Ticker": t,
-            "Price": round(price, 2),
-            "MaxPain": round(max_pain, 2) if max_pain else None,
-            "Deviation%": round(deviation_pct, 2) if deviation_pct else None,
-            "EMA20": round(ema20, 2),
-            "EMA50": round(ema50, 2),
-            "VolumeStrength": round(vol_strength, 2),
-            "Trend": trend
-        })
     return pd.DataFrame(results)
 
 def pick_top_stocks(df):
@@ -109,12 +121,21 @@ def pick_top_stocks(df):
     top_bearish = bearish.sort_values(by=["Deviation%", "VolumeStrength"], ascending=[True, False]).head(5)
     return top_bullish, top_bearish
 
-# ---------- Streamlit App ----------
-st.title("📊 NSE F&O Screener (Max Pain, EMA & Volume) - Using NSEPython")
+# -------- Streamlit App --------
+st.title("📊 NSE F&O Screener (Max Pain, EMA & Volume) - NSE + Bhavcopy")
 
-if st.button("Run Screener on F&O Stocks"):
-    with st.spinner("Fetching data, please wait..."):
-        df = analyze_stocks(FNO_TICKERS)
+if st.button("Run Screener"):
+    with st.spinner("Fetching F&O list..."):
+        fno_list = get_fno_list()
+
+    with st.spinner("Fetching Bhavcopy..."):
+        bhav_df = get_bhavcopy()
+        if bhav_df is None:
+            st.error("Failed to fetch Bhavcopy data.")
+            st.stop()
+
+    with st.spinner("Analyzing stocks..."):
+        df = analyze_stocks(fno_list, bhav_df)
 
     if not df.empty:
         st.subheader("📋 Full Screener Output")
