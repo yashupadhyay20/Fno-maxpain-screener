@@ -43,17 +43,18 @@ def calculate_sma_rsi(df):
 
 def extract_underlying(fut_symbol):
     """Extract underlying stock from F&O contract name"""
-    return re.match(r"[A-Z0-9]+", fut_symbol).group(0)
+    return re.match(r"[A-Z]+", fut_symbol).group(0)
 
 def get_underlying_stocks():
+    """Get unique underlying stock symbols for F&O"""
     instruments = kite.instruments("NFO")
-    underlyings = sorted(set([extract_underlying(i["tradingsymbol"]) for i in instruments if i["segment"]=="NFO-FUT"]))
+    underlyings = sorted(set([extract_underlying(inst["tradingsymbol"]) 
+                              for inst in instruments if inst["segment"]=="NFO-FUT"]))
     return underlyings
 
 def get_fut_oi(stock):
-    """Fetch futures OI for any active contract of the stock"""
+    """Fetch futures OI for any active contract of the underlying stock"""
     instruments = kite.instruments("NFO")
-    # Find first contract matching underlying
     for inst in instruments:
         if inst["segment"]=="NFO-FUT" and inst["tradingsymbol"].startswith(stock):
             try:
@@ -65,7 +66,7 @@ def get_fut_oi(stock):
     return None
 
 def get_option_pcr(stock):
-    """Fetch total CE/PE OI for underlying stock (without strikes)"""
+    """Fetch CE/PE OI for PCR calculation"""
     try:
         ce_symbol = f"NFO:{stock}-CE"
         pe_symbol = f"NFO:{stock}-PE"
@@ -78,7 +79,7 @@ def get_option_pcr(stock):
         return 0, 0, 0
 
 def get_alpha_data(stock):
-    """Fetch historical OHLC from Alpha Vantage for underlying stock"""
+    """Fetch OHLC from Alpha Vantage for underlying stock"""
     try:
         data, _ = ts.get_daily(symbol=f"{stock}.BSE", outputsize="compact")
         df = data.tail(lookback).copy()
