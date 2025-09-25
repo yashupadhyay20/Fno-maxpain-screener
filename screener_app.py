@@ -4,6 +4,7 @@ import pandas as pd
 from kiteconnect import KiteConnect
 from alpha_vantage.timeseries import TimeSeries
 import datetime
+import re
 
 # -----------------------------
 # CONFIG
@@ -18,7 +19,7 @@ kite.set_access_token(KITE_ACCESS_TOKEN)
 ts = TimeSeries(key=ALPHA_VANTAGE_KEY, output_format="pandas")
 
 st.set_page_config(page_title="F&O Screener", layout="wide")
-st.title("📈 F&O Screener - Real SMA/RSI + OI/PCR")
+st.title("📈 F&O Screener - Underlying Stocks Only")
 
 st.sidebar.header("Filter Options")
 lookback = st.sidebar.slider("Lookback (days for SMA/RSI)", 20, 90, 30)
@@ -40,35 +41,44 @@ def calculate_sma_rsi(df):
     df["RSI"] = compute_rsi(df["4. close"], 14)
     return df
 
-def get_fno_stocks():
-    instruments = kite.instruments("NFO")
-    fo_stocks = sorted(set([i["tradingsymbol"].split()[0] for i in instruments if i["segment"]=="NFO-FUT"]))
-    return fo_stocks
+def extract_underlying(fut_symbol):
+    """Extract underlying stock from F&O contract name"""
+    return re.match(r"[A-Z0-9]+", fut_symbol).group(0)
 
-def get_fut_data(stock):
-    """Fetch LTP and OI from futures"""
-    try:
-        ltp_data = kite.ltp(f"NFO:{stock}-FUT")
-        price = ltp_data[f"NFO:{stock}-FUT"]["last_price"]
-        oi = ltp_data[f"NFO:{stock}-FUT"]["oi"]  # Open Interest
-        return price, oi
-    except:
-        return None, None
+def get_underlying_stocks():
+    instruments = kite.instruments("NFO")
+    underlyings = sorted(set([extract_underlying(i["tradingsymbol"]) for i in instruments if i["segment"]=="NFO-FUT"]))
+    return underlyings
+
+def get_fut_oi(stock):
+    """Fetch futures OI for any active contract of the stock"""
+    instruments = kite.instruments("NFO")
+    # Find first contract matching underlying
+    for inst in instruments:
+        if inst["segment"]=="NFO-FUT" and inst["tradingsymbol"].startswith(stock):
+            try:
+                ltp_data = kite.ltp(f"NFO:{inst['tradingsymbol']}")
+                oi = ltp_data[f"NFO:{inst['tradingsymbol']}"]["oi"]
+                return oi
+            except:
+                return None
+    return None
 
 def get_option_pcr(stock):
-    """Fetch total CE/PE OI for PCR (without strikes)"""
+    """Fetch total CE/PE OI for underlying stock (without strikes)"""
     try:
-        ce_pe_symbols = [f"NFO:{stock}-CE", f"NFO:{stock}-PE"]
-        ltp_data = kite.ltp(ce_pe_symbols)
-        ce_oi = ltp_data.get(ce_pe_symbols[0], {}).get("oi", 0)
-        pe_oi = ltp_data.get(ce_pe_symbols[1], {}).get("oi", 0)
+        ce_symbol = f"NFO:{stock}-CE"
+        pe_symbol = f"NFO:{stock}-PE"
+        ltp_data = kite.ltp([ce_symbol, pe_symbol])
+        ce_oi = ltp_data.get(ce_symbol, {}).get("oi", 0)
+        pe_oi = ltp_data.get(pe_symbol, {}).get("oi", 0)
         pcr = pe_oi / ce_oi if ce_oi != 0 else 0
         return ce_oi, pe_oi, pcr
     except:
         return 0, 0, 0
 
 def get_alpha_data(stock):
-    """Fetch historical OHLC from Alpha Vantage"""
+    """Fetch historical OHLC from Alpha Vantage for underlying stock"""
     try:
         data, _ = ts.get_daily(symbol=f"{stock}.BSE", outputsize="compact")
         df = data.tail(lookback).copy()
@@ -76,26 +86,21 @@ def get_alpha_data(stock):
         last = df.iloc[-1]
         return last["4. close"], last["SMA20"], last["SMA50"], last["RSI"]
     except:
-        # fallback if BSE symbol not found
         return None, None, None, None
 
 # -----------------------------
-# F&O Stocks Selection
+# MAIN
 # -----------------------------
-fo_stocks = get_fno_stocks()
-selected_stocks = st.multiselect("Select F&O Stocks", fo_stocks, default=fo_stocks[:5])
+underlying_stocks = get_underlying_stocks()
+selected_stocks = st.multiselect("Select Underlying Stocks", underlying_stocks, default=underlying_stocks[:5])
 
-# -----------------------------
-# Fetch Data
-# -----------------------------
 results = []
-
 for stock in selected_stocks:
-    price, fut_oi = get_fut_data(stock)
-    ce_oi, pe_oi, pcr = get_option_pcr(stock)
     close, sma20, sma50, rsi = get_alpha_data(stock)
+    fut_oi = get_fut_oi(stock)
+    ce_oi, pe_oi, pcr = get_option_pcr(stock)
 
-    if None in [price, close, sma20, sma50, rsi]:
+    if None in [close, sma20, sma50, rsi, fut_oi]:
         continue
 
     results.append({
@@ -111,7 +116,7 @@ for stock in selected_stocks:
     })
 
 # -----------------------------
-# Display Results
+# DISPLAY
 # -----------------------------
 if results:
     df = pd.DataFrame(results)
@@ -119,7 +124,7 @@ if results:
     if show_rsi:
         df = df[(df["RSI"] < 30) | (df["RSI"] > 70)]
 
-    st.subheader("📊 F&O Screener Results")
+    st.subheader("📊 Screener Results")
     st.dataframe(df, use_container_width=True)
 
     st.subheader("⚡ Most Bullish Stocks")
