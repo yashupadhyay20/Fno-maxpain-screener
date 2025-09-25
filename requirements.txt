@@ -3,3 +3,4 @@ nsepython
 pandas
 yfinance
 numpy
+nsepy
