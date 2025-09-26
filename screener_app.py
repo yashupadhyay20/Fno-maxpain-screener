@@ -8,7 +8,7 @@ import re
 # CONFIG
 # -----------------------------
 KITE_API_KEY = "j26mm94rwatmzarj"
-KITE_ACCESS_TOKEN = "jDEHV55RcYV4X1Za6UwP6aUJqz0tnxLB"
+kite.set_access_token("DjipZGLO8lOOLPrNy9MBw6S65MGaMVQI")
 
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
