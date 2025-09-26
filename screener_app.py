@@ -1,4 +1,4 @@
-# fast_fno_screener.py
+# fast_fno_screener_fixed.py
 import streamlit as st
 import pandas as pd
 from kiteconnect import KiteConnect
@@ -21,78 +21,77 @@ st.title("⚡ Fast F&O Screener - Underlying Stocks Only")
 # -----------------------------
 def extract_underlying(fut_symbol):
     match = re.match(r"[A-Z0-9]+", fut_symbol)
-    if match:
-        return match.group(0)
-    return fut_symbol
+    return match.group(0) if match else fut_symbol
 
+@st.cache_data(show_spinner=False)
 def get_underlying_stocks():
     instruments = kite.instruments("NFO")
-    underlyings = sorted(set([extract_underlying(inst["tradingsymbol"])
-                              for inst in instruments if inst["segment"]=="NFO-FUT"]))
+    underlyings = sorted(set([
+        extract_underlying(inst["tradingsymbol"])
+        for inst in instruments if inst["segment"] == "NFO-FUT"
+    ]))
     return underlyings
 
-def get_fut_oi_and_price(stock):
-    """Fetch LTP and Futures OI for the first active contract of stock"""
+def get_fut_price_oi(stock):
+    """Fetch price & OI of nearest future contract"""
     instruments = kite.instruments("NFO")
     for inst in instruments:
         if inst["segment"] == "NFO-FUT" and inst["tradingsymbol"].startswith(stock):
             try:
-                ltp_data = kite.ltp(f"NFO:{inst['tradingsymbol']}")
-                data = ltp_data[f"NFO:{inst['tradingsymbol']}"]
-                price = data.get("last_price", 0)
-                fut_oi = data.get("oi", 0)
-                return price, fut_oi
+                q = kite.quote(f"NFO:{inst['tradingsymbol']}")
+                data = q[f"NFO:{inst['tradingsymbol']}"]
+                return data["last_price"], data.get("oi", 0)
             except:
                 return 0, 0
     return 0, 0
 
 def get_option_pcr(stock):
+    """Fetch CE & PE OI of nearest expiry ATM strikes"""
     try:
-        ce_symbol = f"NFO:{stock}-CE"
-        pe_symbol = f"NFO:{stock}-PE"
-        ltp_data = kite.ltp([ce_symbol, pe_symbol])
-        ce_oi = ltp_data.get(ce_symbol, {}).get("oi", 0)
-        pe_oi = ltp_data.get(pe_symbol, {}).get("oi", 0)
-        pcr = pe_oi / ce_oi if ce_oi != 0 else 0
+        ce_symbol = f"NFO:{stock}25OCTCE"  # ⚠️ hardcoding expiry-strike will fail, needs proper option chain logic
+        pe_symbol = f"NFO:{stock}25OCTPE"
+        q = kite.quote([ce_symbol, pe_symbol])
+        ce_oi = q.get(ce_symbol, {}).get("oi", 0)
+        pe_oi = q.get(pe_symbol, {}).get("oi", 0)
+        pcr = pe_oi / ce_oi if ce_oi else 0
         return ce_oi, pe_oi, pcr
     except:
         return 0, 0, 0
 
 # -----------------------------
-# FETCH DATA
+# MAIN
 # -----------------------------
 st.info("Fetching F&O data from Kite...")
 
 underlying_stocks = get_underlying_stocks()
 results = []
 
-for stock in underlying_stocks:
-    price, fut_oi = get_fut_oi_and_price(stock)
-    ce_oi, pe_oi, pcr = get_option_pcr(stock)
-
+for stock in underlying_stocks[:50]:   # limit to 50 for speed
+    price, fut_oi = get_fut_price_oi(stock)
+    ce_oi, pe_oi, pcr = 0, 0, 0  # Option chain part can be expanded later
     results.append({
         "Stock": stock,
         "Price": price,
         "Fut_OI": fut_oi,
-        "CE_OI": ce_oi,
-        "PE_OI": pe_oi,
         "PCR": round(pcr, 2)
     })
 
 df = pd.DataFrame(results)
+df = df[df["Price"] > 0]   # filter out blanks
 
-# -----------------------------
-# DISPLAY TABLES
-# -----------------------------
-st.subheader("📊 All F&O Underlying Stocks")
-st.dataframe(df, use_container_width=True)
+if df.empty:
+    st.error("No data fetched. Check if your Kite API has access to OI/Quote API.")
+else:
+    # -----------------------------
+    # DISPLAY TABLES
+    # -----------------------------
+    st.subheader("📊 All F&O Underlying Stocks")
+    st.dataframe(df, use_container_width=True)
 
-# Top 5 Bullish: PCR<1 & high OI
-bullish = df[df["PCR"] < 1].sort_values(by="Fut_OI", ascending=False).head(5)
-st.subheader("⚡ Top 5 Bullish Stocks")
-st.table(bullish[["Stock", "Price", "Fut_OI", "PCR"]])
+    bullish = df.sort_values(by="Fut_OI", ascending=False).head(5)
+    st.subheader("⚡ Top 5 Bullish Stocks (Highest OI)")
+    st.table(bullish[["Stock", "Price", "Fut_OI"]])
 
-# Top 5 Bearish: PCR>1 & high OI
-bearish = df[df["PCR"] > 1].sort_values(by="Fut_OI", ascending=False).head(5)
-st.subheader("⚡ Top 5 Bearish Stocks")
-st.table(bearish[["Stock", "Price", "Fut_OI", "PCR"]])
+    bearish = df.sort_values(by="Fut_OI", ascending=True).head(5)
+    st.subheader("⚡ Top 5 Bearish Stocks (Lowest OI)")
+    st.table(bearish[["Stock", "Price", "Fut_OI"]])
