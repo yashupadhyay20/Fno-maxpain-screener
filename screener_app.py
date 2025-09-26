@@ -1,30 +1,38 @@
-# fast_fno_screener_fixed.py
+# screener_app.py
 import streamlit as st
 import pandas as pd
-from kiteconnect import KiteConnect
 import re
+from kiteconnect import KiteConnect
 
 # -----------------------------
-# CONFIG
+# ZERODHA CREDENTIALS
 # -----------------------------
-KITE_API_KEY = "j26mm94rwatmzarj"
-kite.set_access_token("DjipZGLO8lOOLPrNy9MBw6S65MGaMVQI")
+API_KEY = "j26mm94rwatmzarj"
+ACCESS_TOKEN = "DjipZGLO8lOOLPrNy9MBw6S65MGaMVQI"
 
-kite = KiteConnect(api_key=KITE_API_KEY)
-kite.set_access_token(KITE_ACCESS_TOKEN)
+# -----------------------------
+# KITE SESSION
+# -----------------------------
+kite = KiteConnect(api_key=API_KEY)
+kite.set_access_token(ACCESS_TOKEN)
 
-st.set_page_config(page_title="Fast F&O Screener", layout="wide")
-st.title("⚡ Fast F&O Screener - Underlying Stocks Only")
+# -----------------------------
+# STREAMLIT PAGE CONFIG
+# -----------------------------
+st.set_page_config(page_title="F&O Screener", layout="wide")
+st.title("📈 F&O Screener - Underlying Stocks")
 
 # -----------------------------
 # HELPER FUNCTIONS
 # -----------------------------
-def extract_underlying(fut_symbol):
-    match = re.match(r"[A-Z0-9]+", fut_symbol)
-    return match.group(0) if match else fut_symbol
+def extract_underlying(symbol):
+    """Remove expiry part from F&O symbol"""
+    match = re.match(r"[A-Z0-9]+", symbol)
+    return match.group(0) if match else symbol
 
 @st.cache_data(show_spinner=False)
 def get_underlying_stocks():
+    """Fetch unique underlying stocks from NFO Futures"""
     instruments = kite.instruments("NFO")
     underlyings = sorted(set([
         extract_underlying(inst["tradingsymbol"])
@@ -40,23 +48,12 @@ def get_fut_price_oi(stock):
             try:
                 q = kite.quote(f"NFO:{inst['tradingsymbol']}")
                 data = q[f"NFO:{inst['tradingsymbol']}"]
-                return data["last_price"], data.get("oi", 0)
-            except:
+                price = data.get("last_price", 0)
+                fut_oi = data.get("oi", 0)
+                return price, fut_oi
+            except Exception as e:
                 return 0, 0
     return 0, 0
-
-def get_option_pcr(stock):
-    """Fetch CE & PE OI of nearest expiry ATM strikes"""
-    try:
-        ce_symbol = f"NFO:{stock}25OCTCE"  # ⚠️ hardcoding expiry-strike will fail, needs proper option chain logic
-        pe_symbol = f"NFO:{stock}25OCTPE"
-        q = kite.quote([ce_symbol, pe_symbol])
-        ce_oi = q.get(ce_symbol, {}).get("oi", 0)
-        pe_oi = q.get(pe_symbol, {}).get("oi", 0)
-        pcr = pe_oi / ce_oi if ce_oi else 0
-        return ce_oi, pe_oi, pcr
-    except:
-        return 0, 0, 0
 
 # -----------------------------
 # MAIN
@@ -66,21 +63,19 @@ st.info("Fetching F&O data from Kite...")
 underlying_stocks = get_underlying_stocks()
 results = []
 
-for stock in underlying_stocks[:50]:   # limit to 50 for speed
+for stock in underlying_stocks[:50]:   # limit to first 50 for speed
     price, fut_oi = get_fut_price_oi(stock)
-    ce_oi, pe_oi, pcr = 0, 0, 0  # Option chain part can be expanded later
     results.append({
         "Stock": stock,
         "Price": price,
-        "Fut_OI": fut_oi,
-        "PCR": round(pcr, 2)
+        "Fut_OI": fut_oi
     })
 
 df = pd.DataFrame(results)
-df = df[df["Price"] > 0]   # filter out blanks
+df = df[df["Price"] > 0]   # filter blanks
 
 if df.empty:
-    st.error("No data fetched. Check if your Kite API has access to OI/Quote API.")
+    st.error("⚠️ No data fetched. Check if your API plan includes OI (Market Data).")
 else:
     # -----------------------------
     # DISPLAY TABLES
@@ -89,9 +84,9 @@ else:
     st.dataframe(df, use_container_width=True)
 
     bullish = df.sort_values(by="Fut_OI", ascending=False).head(5)
-    st.subheader("⚡ Top 5 Bullish Stocks (Highest OI)")
+    st.subheader("🚀 Top 5 Bullish Stocks (Highest OI)")
     st.table(bullish[["Stock", "Price", "Fut_OI"]])
 
     bearish = df.sort_values(by="Fut_OI", ascending=True).head(5)
-    st.subheader("⚡ Top 5 Bearish Stocks (Lowest OI)")
+    st.subheader("🐻 Top 5 Bearish Stocks (Lowest OI)")
     st.table(bearish[["Stock", "Price", "Fut_OI"]])
